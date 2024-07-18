@@ -12,6 +12,8 @@ import torch as th
 from gymnasium import spaces
 from torch import nn
 
+from GNN import GraphNN
+
 from stable_baselines3.common.distributions import (
     BernoulliDistribution,
     CategoricalDistribution,
@@ -367,7 +369,7 @@ class BasePolicy(BaseModel, ABC):
         with th.no_grad():
             actions = self._predict(obs_tensor, deterministic=deterministic)
         # Convert to numpy, and reshape to the original action shape
-        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
+        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc]
 
         if isinstance(self.action_space, spaces.Box):
             if self.squash_output:
@@ -534,6 +536,9 @@ class ActorCriticPolicy(BasePolicy):
 
         self._build(lr_schedule)
 
+        self.gnn = GraphNN()
+
+
     def _get_constructor_parameters(self) -> Dict[str, Any]:
         data = super()._get_constructor_parameters()
 
@@ -642,19 +647,22 @@ class ActorCriticPolicy(BasePolicy):
         :return: action, value and log probability of the action
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        # Evaluate the values for the given observations
-        values = self.value_net(latent_vf)
-        distribution = self._get_action_dist_from_latent(latent_pi)
-        actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
-        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
+        # features = self.extract_features(obs)
+        # if self.share_features_extractor:
+        #     latent_pi, latent_vf = self.mlp_extractor(features)
+        # else:
+        #     pi_features, vf_features = features
+        #     latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        #     latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        # # Evaluate the values for the given observations
+        # values = self.value_net(latent_vf)
+        # distribution = self._get_action_dist_from_latent(latent_pi)
+        # actions = distribution.get_actions(deterministic=deterministic)
+        # log_prob = distribution.log_prob(actions)
+        # actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
+
+        values, actions, log_prob, entropy = self.gnn.forward(obs['Graph'][0], obs['h'], obs['L'], obs['W'], obs['P'], obs['N'])
+        # print("values", values, "actions", actions, "log_prob", log_prob)
         return actions, values, log_prob
 
     def extract_features(  # type: ignore[override]
@@ -727,17 +735,58 @@ class ActorCriticPolicy(BasePolicy):
             and entropy of the action distribution.
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
-        if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        distribution = self._get_action_dist_from_latent(latent_pi)
-        log_prob = distribution.log_prob(actions)
-        values = self.value_net(latent_vf)
-        entropy = distribution.entropy()
+        # features = self.extract_features(obs)
+        # if self.share_features_extractor:
+        #     latent_pi, latent_vf = self.mlp_extractor(features)
+        # else:
+        #     pi_features, vf_features = features
+        #     latent_pi = self.mlp_extractor.forward_actor(pi_features)
+        #     latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        # distribution = self._get_action_dist_from_latent(latent_pi)
+        # log_prob = distribution.log_prob(actions)
+        # values = self.value_net(latent_vf)
+        # entropy = distribution.entropy()
+
+        batch_size = obs['Graph'].shape[0]  # 获取批次大小
+
+        # 初始化结果列表
+        all_values = []
+        all_actions = []
+        all_log_prob = []
+        all_entropy = []
+
+        # 循环处理每个批次
+        for i in range(batch_size):
+            # 获取当前批次的输入
+            graph = obs['Graph'][i]
+            h = obs['h'][i]
+            L = obs['L'][i]
+            W = obs['W'][i]
+            P = obs['P'][i]
+            N = obs['N'][i]
+
+            # 调用 forward 方法处理当前批次
+            values_, actions_, log_prob_, entropy_ = self.gnn.forward(graph, h, L, W, P, N)
+
+            # 将结果添加到结果列表
+            all_values.append(values_)
+            all_actions.append(actions_)
+            all_log_prob.append(log_prob_)
+            all_entropy.append(entropy_)
+
+        # 将结果从列表转换为张量，并添加批次维度
+        values = th.stack(all_values).view((batch_size, 1))
+        actions = th.stack(all_actions).view(batch_size)
+        log_prob = th.stack(all_log_prob).view(batch_size)
+        entropy = th.stack(all_entropy).view(batch_size)
+
+        """
+        obs也带batch
+        values.shape = [64, 1]
+        log_prob.shape = [64]
+        entropy.shape = [64]
+        """
+        # print("entropy", entropy)
         return values, log_prob, entropy
 
     def get_distribution(self, obs: PyTorchObs) -> Distribution:
@@ -922,7 +971,7 @@ class ContinuousCritic(BaseModel):
     By default, it creates two critic networks used to reduce overestimation
     thanks to clipped Q-learning (cf TD3 paper).
 
-    :param observation_space: Observation space
+    :param observation_space: Obervation space
     :param action_space: Action space
     :param net_arch: Network architecture
     :param features_extractor: Network to extract features
